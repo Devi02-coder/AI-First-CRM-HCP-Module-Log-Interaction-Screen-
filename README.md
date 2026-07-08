@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # AI-First CRM - HCP Interaction Management Screen
 
 An enterprise pharma CRM module powered by a LangGraph agent that enables medical representatives to log and manage interactions with Healthcare Professionals (HCPs) using natural language, voice notes, and real-time form sync.
@@ -74,3 +75,7 @@ An enterprise pharma CRM module powered by a LangGraph agent that enables medica
    npm run dev
    ```
    Open [http://localhost:5173/](http://localhost:5173/) to access the interface.
+=======
+# AI-First-CRM-HCP-Module-Log-Interaction-Screen-
+AI-powered HCP CRM platform built with React, FastAPI, LangGraph, Groq LLM, and MySQL. Log, edit, and manage healthcare professional interactions using natural language and voice commands with automatic AI-driven form population and CRM workflow automation.
+>>>>>>> 9c0aa4c2071044ef90b2a1302ae661f05cbc201c
