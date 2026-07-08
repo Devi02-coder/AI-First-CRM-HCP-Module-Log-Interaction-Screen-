@@ -52,4 +52,13 @@ export const getHCPHistory = async (id: number) => {
   return data;
 };
 
+export const transcribeAudio = async (file: File): Promise<{ text: string }> => {
+  const formData = new FormData();
+  formData.append('file', file);
+  const { data } = await api.post<{ text: string }>('/api/transcribe', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  });
+  return data;
+};
+
 export default api;

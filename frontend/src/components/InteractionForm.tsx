@@ -1,6 +1,16 @@
-import React from 'react';
+import React, { useState, useRef } from 'react';
 import { useAppDispatch, useAppSelector } from '../store';
-import { updateInteractionField } from '../store/slices';
+import {
+  updateInteractionField,
+  setActiveInteraction,
+  addMessage,
+  setLoading,
+  setTyping,
+  setToolLogs,
+  clearToolLogs,
+  addToast
+} from '../store/slices';
+import { sendChatMessage, transcribeAudio } from '../services/api';
 import {
   Calendar, Clock, Mic, Search, Plus,
   Smile, Meh, Frown, Gift
@@ -10,6 +20,301 @@ const InteractionForm: React.FC = () => {
   const dispatch = useAppDispatch();
   const { activeInteraction } = useAppSelector(s => s.interaction);
   const d = activeInteraction;
+
+  const [isRecordingMic, setIsRecordingMic] = useState(false);
+  const [isRecordingVoiceNote, setIsRecordingVoiceNote] = useState(false);
+  const [micStatus, setMicStatus] = useState<'ready' | 'recording' | 'processing' | 'complete'>('ready');
+  const [voiceStatus, setVoiceStatus] = useState<'ready' | 'recording' | 'processing' | 'complete'>('ready');
+  const recognitionMicRef = useRef<any>(null);
+  const recognitionVoiceNoteRef = useRef<any>(null);
+  const voiceTranscriptRef = useRef<string>('');
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const uploadFallbackTargetRef = useRef<'mic' | 'voice_note' | null>(null);
+
+  const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+
+  const requestMicPermission = async () => {
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('browser-unsupported');
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach(track => track.stop());
+      return true;
+    } catch (err: any) {
+      console.error('Microphone permission check failed:', err);
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        throw new Error('permission-denied');
+      } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+        throw new Error('no-microphone');
+      } else if (err.message === 'browser-unsupported') {
+        throw new Error('browser-unsupported');
+      } else {
+        throw new Error('permission-blocked');
+      }
+    }
+  };
+
+  const handleMicError = (errorType: string, target: 'mic' | 'voice_note') => {
+    let message = '';
+    switch (errorType) {
+      case 'permission-denied':
+        message = 'Microphone access is required for voice input. Please allow microphone permissions in your browser settings.';
+        break;
+      case 'permission-blocked':
+        message = 'Microphone permission blocked or unavailable. Please review browser settings.';
+        break;
+      case 'no-microphone':
+        message = 'No microphone found on your device. Please connect a microphone.';
+        break;
+      case 'browser-unsupported':
+        message = 'Speech recognition or media device access is not supported by your browser.';
+        break;
+      default:
+        message = 'Microphone permission denied';
+    }
+    
+    dispatch(addToast({
+      id: Date.now().toString(),
+      type: 'error',
+      message: message,
+    }));
+    
+    uploadFallbackTargetRef.current = target;
+    triggerAudioUploadFallback();
+  };
+
+  const triggerAudioUploadFallback = () => {
+    const confirmUpload = window.confirm(
+      'Microphone access is blocked. Would you like to upload an audio file (mp3, wav, m4a, webm) to transcribe instead?'
+    );
+    if (confirmUpload && fileInputRef.current) {
+      fileInputRef.current.click();
+    }
+  };
+
+  const handleAudioFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    e.target.value = '';
+    const target = uploadFallbackTargetRef.current;
+    if (target === 'mic') {
+      setMicStatus('processing');
+    } else {
+      setVoiceStatus('processing');
+    }
+
+    try {
+      const resp = await transcribeAudio(file);
+      const text = resp.text;
+      
+      if (target === 'mic') {
+        const currentText = d.key_discussion_points ? d.key_discussion_points + ' ' : '';
+        handleInputChange('key_discussion_points', currentText + text);
+        setMicStatus('complete');
+        setTimeout(() => setMicStatus('ready'), 3000);
+      } else {
+        setVoiceStatus('complete');
+        setTimeout(() => setVoiceStatus('ready'), 3000);
+        submitVoiceTranscript(text);
+      }
+    } catch (err) {
+      console.error('Upload transcription failed:', err);
+      dispatch(addToast({
+        id: Date.now().toString(),
+        type: 'error',
+        message: 'Audio transcription failed. Please check backend connection.',
+      }));
+      if (target === 'mic') {
+        setMicStatus('ready');
+      } else {
+        setVoiceStatus('ready');
+      }
+    }
+  };
+
+  const toggleMicRecording = async () => {
+    if (isRecordingMic) {
+      if (recognitionMicRef.current) {
+        recognitionMicRef.current.stop();
+      }
+      setIsRecordingMic(false);
+      setMicStatus('ready');
+    } else {
+      try {
+        setMicStatus('processing');
+        await requestMicPermission();
+        
+        if (!SpeechRecognition) {
+          throw new Error('browser-unsupported');
+        }
+        
+        const rec = new SpeechRecognition();
+        rec.continuous = true;
+        rec.interimResults = false;
+        rec.lang = 'en-US';
+        
+        rec.onstart = () => {
+          setIsRecordingMic(true);
+          setMicStatus('recording');
+        };
+        
+        rec.onresult = (event: any) => {
+          const resultText = event.results[event.results.length - 1][0].transcript;
+          const currentText = d.key_discussion_points ? d.key_discussion_points + ' ' : '';
+          handleInputChange('key_discussion_points', currentText + resultText);
+        };
+        
+        rec.onerror = (event: any) => {
+          console.error(event.error);
+          setIsRecordingMic(false);
+          setMicStatus('ready');
+          handleMicError(event.error === 'not-allowed' ? 'permission-denied' : event.error, 'mic');
+        };
+        
+        rec.onend = () => {
+          setIsRecordingMic(false);
+          setMicStatus('complete');
+          setTimeout(() => setMicStatus('ready'), 2000);
+        };
+        
+        recognitionMicRef.current = rec;
+        rec.start();
+      } catch (err: any) {
+        setMicStatus('ready');
+        handleMicError(err.message, 'mic');
+      }
+    }
+  };
+
+  const submitVoiceTranscript = async (text: string) => {
+    dispatch(clearToolLogs());
+    dispatch(addMessage({ sender: 'user', message: text, timestamp: new Date().toISOString() }));
+    dispatch(setLoading(true));
+    dispatch(setTyping(true));
+    
+    try {
+      const resp = await sendChatMessage(text);
+      if (resp.tool_execution_logs?.length) {
+        dispatch(setToolLogs(resp.tool_execution_logs));
+      }
+      if (resp.interaction_data && Object.keys(resp.interaction_data).length > 0) {
+        const d = resp.interaction_data;
+        dispatch(setActiveInteraction({
+          id: d.id,
+          hcp_name: d.hcp_name || '',
+          specialty: d.specialty || '',
+          hospital_clinic: d.hospital_clinic || '',
+          tier: d.tier || 'B',
+          territory: d.territory || '',
+          interaction_date: d.interaction_date || '',
+          interaction_time: d.interaction_time || '19:36',
+          interaction_type: d.interaction_type || 'Meeting',
+          attendees: d.attendees || '',
+          visit_objective: d.visit_objective || '',
+          products_discussed: d.products_discussed || [],
+          samples_distributed: d.samples_distributed || [],
+          materials_shared: d.materials_shared || [],
+          key_discussion_points: d.key_discussion_points || '',
+          objections_raised: d.objections_raised || '',
+          sentiment: d.sentiment || 'Neutral',
+          outcome: d.outcome || '',
+          follow_up_required: d.follow_up_required || false,
+          follow_up_date: d.follow_up_date || '',
+          next_best_action: d.next_best_action || '',
+          interaction_summary: d.interaction_summary || '',
+          validation_status: d.validation_status || 'Pending',
+          last_updated: new Date().toISOString(),
+        }));
+        
+        dispatch(addToast({
+          id: Date.now().toString(),
+          type: resp.validation_status === 'Valid' ? 'success' : 'info',
+          message: resp.validation_status === 'Valid'
+            ? 'CRM record saved and validated.'
+            : 'Record saved with validation alerts.',
+        }));
+      }
+      dispatch(addMessage({
+        sender: 'assistant',
+        message: resp.response,
+        timestamp: new Date().toISOString()
+      }));
+    } catch {
+      dispatch(addMessage({
+        sender: 'assistant',
+        message: 'Could not communicate with the CRM agent. Please check if the FastAPI backend is running.',
+        timestamp: new Date().toISOString()
+      }));
+    } finally {
+      dispatch(setLoading(false));
+      dispatch(setTyping(false));
+    }
+  };
+
+  const startVoiceNoteRecording = async () => {
+    try {
+      const consent = window.confirm('Do you consent to enable microphone access to record and transcribe your voice note?');
+      if (!consent) return;
+
+      setVoiceStatus('processing');
+      await requestMicPermission();
+      
+      if (!SpeechRecognition) {
+        throw new Error('browser-unsupported');
+      }
+
+      const rec = new SpeechRecognition();
+      rec.continuous = true;
+      rec.interimResults = false;
+      rec.lang = 'en-US';
+      voiceTranscriptRef.current = '';
+
+      rec.onstart = () => {
+        setIsRecordingVoiceNote(true);
+        setVoiceStatus('recording');
+      };
+      rec.onresult = (event: any) => {
+        const resultText = event.results[event.results.length - 1][0].transcript;
+        voiceTranscriptRef.current += (voiceTranscriptRef.current ? ' ' : '') + resultText;
+      };
+      rec.onerror = (event: any) => {
+        console.error(event.error);
+        setIsRecordingVoiceNote(false);
+        setVoiceStatus('ready');
+        handleMicError(event.error === 'not-allowed' ? 'permission-denied' : event.error, 'voice_note');
+      };
+      rec.onend = async () => {
+        setIsRecordingVoiceNote(false);
+        setVoiceStatus('complete');
+        setTimeout(() => setVoiceStatus('ready'), 2000);
+        
+        const text = voiceTranscriptRef.current.trim();
+        if (!text) {
+          dispatch(addToast({
+            id: Date.now().toString(),
+            type: 'info',
+            message: 'No speech detected.',
+          }));
+          return;
+        }
+        submitVoiceTranscript(text);
+      };
+
+      recognitionVoiceNoteRef.current = rec;
+      rec.start();
+    } catch (err: any) {
+      setVoiceStatus('ready');
+      handleMicError(err.message, 'voice_note');
+    }
+  };
+
+  const stopVoiceNoteRecording = () => {
+    if (recognitionVoiceNoteRef.current) {
+      recognitionVoiceNoteRef.current.stop();
+    }
+  };
 
   const handleInputChange = (field: string, value: any) => {
     dispatch(updateInteractionField({ [field]: value }));
@@ -125,21 +430,69 @@ const InteractionForm: React.FC = () => {
             value={d.key_discussion_points || ''}
             onChange={(e) => handleInputChange('key_discussion_points', e.target.value)}
           />
-          <Mic className="absolute bottom-3 right-3 w-4 h-4 text-slate-400 cursor-pointer hover:text-slate-600" />
+          <Mic
+            onClick={toggleMicRecording}
+            title={micStatus === 'ready' ? '🎤 Click to record' : micStatus === 'recording' ? '🔴 Recording — click to stop' : micStatus === 'processing' ? '⏳ Checking permission…' : '✅ Done'}
+            className={`absolute bottom-3 right-3 w-4 h-4 cursor-pointer transition-colors ${
+              micStatus === 'recording' ? 'text-red-500 animate-pulse' :
+              micStatus === 'processing' ? 'text-amber-400 animate-bounce' :
+              micStatus === 'complete' ? 'text-emerald-500' : 'text-slate-400 hover:text-slate-600'
+            }`}
+          />
         </div>
+        {micStatus !== 'ready' && (
+          <p className={`text-[10px] mt-1 font-medium ${
+            micStatus === 'recording' ? 'text-red-500' :
+            micStatus === 'processing' ? 'text-amber-500' : 'text-emerald-600'
+          }`}>
+            {micStatus === 'recording' ? '🔴 Recording…' : micStatus === 'processing' ? '⏳ Checking microphone permission…' : '✅ Done'}
+          </p>
+        )}
       </div>
 
-      {/* Voice Note Button */}
+      {/* Voice Note Button + Status */}
       <div className="mb-5">
         <button
           type="button"
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-[#eaeef4] hover:bg-[#dee4ec] text-[11px] font-semibold text-slate-700 rounded-md border border-slate-300/40 transition-colors"
+          onClick={isRecordingVoiceNote ? stopVoiceNoteRecording : startVoiceNoteRecording}
+          disabled={voiceStatus === 'processing'}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md border transition-colors text-[11px] font-semibold ${
+            isRecordingVoiceNote
+              ? 'bg-red-500 hover:bg-red-600 text-white border-red-500 animate-pulse'
+              : voiceStatus === 'processing'
+              ? 'bg-amber-50 text-amber-600 border-amber-300 cursor-not-allowed'
+              : voiceStatus === 'complete'
+              ? 'bg-emerald-50 text-emerald-700 border-emerald-300'
+              : 'bg-[#eaeef4] hover:bg-[#dee4ec] text-slate-700 border-slate-300/40'
+          }`}
         >
-          <svg className="w-3.5 h-3.5 text-slate-600" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" d="M19.114 5.636a9 9 0 0 1 0 12.728M16.463 8.288a5.25 5.25 0 0 1 0 7.424M6.75 8.25l4.72-4.72a.75.75 0 0 1 1.28.53v15.88a.75.75 0 0 1-1.28.53l-4.72-4.72H4.51c-.88 0-1.704-.507-1.938-1.354A9.009 9.009 0 0 1 2.25 12c0-.83.112-1.633.322-2.396C2.806 8.756 3.63 8.25 4.51 8.25H6.75Z" />
-          </svg>
-          Summarize from Voice Note (Requires Consent)
+          {isRecordingVoiceNote ? (
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded-full bg-white animate-ping" />
+              🔴 Recording… Click to Stop
+            </span>
+          ) : voiceStatus === 'processing' ? (
+            <span>⏳ Checking microphone permission…</span>
+          ) : voiceStatus === 'complete' ? (
+            <span>✅ Voice note processed</span>
+          ) : (
+            <>
+              <svg className="w-3.5 h-3.5 text-slate-600" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19.114 5.636a9 9 0 0 1 0 12.728M16.463 8.288a5.25 5.25 0 0 1 0 7.424M6.75 8.25l4.72-4.72a.75.75 0 0 1 1.28.53v15.88a.75.75 0 0 1-1.28.53l-4.72-4.72H4.51c-.88 0-1.704-.507-1.938-1.354A9.009 9.009 0 0 1 2.25 12c0-.83.112-1.633.322-2.396C2.806 8.756 3.63 8.25 4.51 8.25H6.75Z" />
+              </svg>
+              🎤 Summarize from Voice Note (Requires Consent)
+            </>
+          )}
         </button>
+
+        {/* Hidden audio file input for Whisper fallback */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="audio/mp3,audio/mpeg,audio/wav,audio/x-wav,audio/m4a,audio/mp4,audio/webm,.mp3,.wav,.m4a,.webm"
+          className="hidden"
+          onChange={handleAudioFileUpload}
+        />
       </div>
 
       {/* Section: Materials Shared / Samples Distributed */}

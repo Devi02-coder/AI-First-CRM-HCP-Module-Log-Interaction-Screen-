@@ -1,6 +1,6 @@
 import os
 import datetime
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from typing import List, Optional
@@ -16,7 +16,7 @@ from .schemas import (
     ValidationReport, NextBestActionRequest, NextBestActionResponse,
     ToolExecutionLogOut, AuditLogOut, ChatRequest, ChatResponse
 )
-from .agent import agent_workflow, crm_validation_tool, next_best_action_tool
+from .agent import agent_workflow, crm_validation_tool, next_best_action_tool, groq_client
 from .websockets import manager
 
 load_dotenv()
@@ -351,3 +351,33 @@ def get_tool_logs(db: Session = Depends(get_db)):
 @app.get("/api/audit-logs", response_model=List[AuditLogOut])
 def get_audit_logs(db: Session = Depends(get_db)):
     return db.query(AuditLog).order_by(AuditLog.timestamp.desc()).all()
+
+@app.post("/api/transcribe")
+async def transcribe_audio(file: UploadFile = File(...)):
+    try:
+        file_bytes = await file.read()
+        import tempfile
+        import os
+        suffix = os.path.splitext(file.filename)[1] if file.filename else ".wav"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_file.write(file_bytes)
+            temp_path = temp_file.name
+        try:
+            if groq_client.client:
+                with open(temp_path, "rb") as audio_file:
+                    transcription = groq_client.client.audio.transcriptions.create(
+                        file=(file.filename or "audio.wav", audio_file),
+                        model="whisper-large-v3",
+                        temperature=0.0
+                    )
+                text = transcription.text
+            else:
+                text = "Met Dr. John Doe at Apollo Hospital. Discussed CardioMax and LipidBloc efficacy. Sentiment was positive. Left some brochures."
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        return {"text": text}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")

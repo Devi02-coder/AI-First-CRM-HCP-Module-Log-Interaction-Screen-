@@ -277,7 +277,8 @@ def response_generation_node(state: CRMState) -> Dict[str, Any]:
     user_msg = messages[-1]["message"] if messages else ""
     current_data = state.get("interaction_data", {})
     history = state.get("conversation_memory", [])
-    
+    intent = state.get("current_tool", "simple_chat")
+
     # Build context to feed Groq chat completion
     context = {
         "hcp_name": current_data.get("hcp_name"),
@@ -289,13 +290,21 @@ def response_generation_node(state: CRMState) -> Dict[str, Any]:
         "products": current_data.get("products_discussed", []),
         "validation_status": state.get("validation_status")
     }
-    
-    chat_resp = groq_client.chat_response(user_msg, messages, context)
+
+    # Collect applied changes for edit responses (from audit_log)
+    applied_changes = {}
+    for entry in state.get("audit_log", []):
+        field = entry.get("field_name", "")
+        new_val = entry.get("new_value", "")
+        if field:
+            applied_changes[field] = new_val
+
+    chat_resp = groq_client.chat_response(user_msg, messages, context, intent=intent, applied_changes=applied_changes)
     new_message = {"sender": "assistant", "message": chat_resp}
-    
+
     return {
         "messages": messages + [new_message],
-        "tool_logs": state.get("tool_logs", []) + [{"step": "Response Generation Node", "status": "Generated conversational response"}]
+        "tool_logs": state.get("tool_logs", []) + [{"step": "Response Generation Node", "status": "Generated CRM-style response"}]
     }
 
 def audit_logging_node(state: CRMState, config: RunnableConfig) -> Dict[str, Any]:

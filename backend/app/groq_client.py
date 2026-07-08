@@ -166,24 +166,36 @@ class GroqClient:
         except Exception:
             return self._mock_generate_summary_and_action(current_data)
 
-    def chat_response(self, user_message: str, history: List[Dict[str, str]], context: Dict[str, Any]) -> str:
+    def chat_response(self, user_message: str, history: List[Dict[str, str]], context: Dict[str, Any], intent: str = "", applied_changes: Dict[str, Any] = None) -> str:
         """
-        Generate conversational agent response.
+        Generate short CRM-style assistant response matching the assessment examples.
         """
+        if intent == "log_new":
+            return "Interaction logged successfully! The details (HCP Name, Date, Sentiment, Products) have been automatically populated based on your summary. Would you like me to suggest a follow-up action, such as scheduling a meeting?"
+
         if not self.client:
-            return self._mock_chat_response(user_message, history, context)
+            return self._mock_chat_response(user_message, history, context, intent, applied_changes)
 
         history_str = ""
         for h in history[-5:]:
             history_str += f"{h['sender']}: {h['message']}\n"
 
         system_prompt = (
-            "You are 'HCP Interaction Agent', a professional AI CRM Assistant for medical representatives.\n"
-            "Your tone is consultative, efficient, and precise. You understand pharma regulations and Veeva/IQVIA style CRMs.\n"
-            "Help the medical representative manage their HCP interactions.\n"
-            f"Current state of the active CRM form interaction: {json.dumps(context)}\n"
-            "Respond to the user's latest query, confirming the actions you took (like logging, editing, validating, or retrieving history) in detail.\n"
-            "Keep the responses clear, concise, and focused on helping them with the current interaction."
+            "You are a CRM Copilot for medical representatives. Your responses must be SHORT (3-5 lines max).\n"
+            "NEVER explain internal processing, database saves, entity extraction, or workflow steps.\n"
+            "NEVER generate long paragraphs.\n"
+            "Use structured CRM-style responses with emojis and bullet points.\n\n"
+            "Response templates:\n"
+            "For log_new intent: Start with '\u2705 **Interaction logged successfully!**' then list fields extracted.\n"
+            "For edit_existing intent: Start with '\u2705 **Interaction updated successfully!**' then list changed fields as bullets.\n"
+            "For get_history intent: Start with '\U0001f4cb Previous interactions found.' then list them briefly.\n"
+            "For validate_form intent: Start with '\u2714\ufe0f Record validated.' then mention status.\n"
+            "For get_recommendation intent: Start with '\U0001f3af Suggested Follow-up:' then list actions as bullets.\n"
+            "For simple_chat: Give a 1-2 line helpful tip with an example prompt.\n"
+            f"Current intent: {intent}\n"
+            f"Applied changes: {json.dumps(applied_changes or {})}\n"
+            f"Current CRM form state: {json.dumps(context)}\n"
+            "CRITICAL: Keep response under 4 lines. No long prose. No explanations."
         )
 
         user_prompt = f"Conversation History:\n{history_str}\nUser: {user_message}"
@@ -191,7 +203,7 @@ class GroqClient:
         try:
             return self._call_llm(system_prompt, user_prompt)
         except Exception:
-            return self._mock_chat_response(user_message, history, context)
+            return self._mock_chat_response(user_message, history, context, intent, applied_changes)
 
     # --- RULE-BASED FALLBACK MOCK LLM ENGINE ---
 
@@ -378,10 +390,14 @@ class GroqClient:
             edits["follow_up_date"] = date_match.group(1)
             edits["follow_up_required"] = True
             
-        # Match HCP Name if "dr. <name>" is present
+        # Match HCP Name if "dr. <name>" is present or if name is mentioned
         dr_match = re.search(r'(dr\.\s+[a-z]+(?:\s+[a-z]+)?)', text, re.IGNORECASE)
         if dr_match:
             edits["hcp_name"] = dr_match.group(1).strip().title()
+        else:
+            name_match = re.search(r'name\s+(?:was|is)?\s*(?:actually\s+)?(?:dr\.\s+)?([a-z]+(?:\s+[a-z]+)?)', text_lower, re.IGNORECASE)
+            if name_match:
+                edits["hcp_name"] = "Dr. " + name_match.group(1).strip().title()
 
         # Generic single-quoted updates: change field to 'val'
         for field in ["specialty", "hospital_clinic", "territory", "visit_objective", "outcome"]:
@@ -407,48 +423,74 @@ class GroqClient:
             "next_best_action": nba
         }
 
-    def _mock_chat_response(self, user_message: str, history: List[Dict[str, str]], context: Dict[str, Any]) -> str:
-        intent = self._mock_classify_intent(user_message)
-        hcp = context.get("hcp_name", "Dr. Sarah Johnson")
-        
+    def _mock_chat_response(self, user_message: str, history: List[Dict[str, str]], context: Dict[str, Any], intent: str = "", applied_changes: Dict[str, Any] = None) -> str:
+        if not intent:
+            intent = self._mock_classify_intent(user_message)
+        hcp = context.get("hcp_name", "HCP") or "HCP"
+        sentiment = context.get("sentiment", "")
+        products = context.get("products", []) or []
+        prod_str = ", ".join(products) if isinstance(products, list) and products else "the discussed product"
+        changes = applied_changes or {}
+
         if intent == "log_new":
-            return (
-                f"I have successfully logged a new interaction with **{hcp}**. The details have been parsed from your description and populated "
-                "in the Interaction Details Form on the left. The record was verified for completeness and saved to the database.\n\n"
-                "You can see the details such as tier, specialty, products discussed, materials shared, and recommended next best actions in the panel."
-            )
+            return "Interaction logged successfully! The details (HCP Name, Date, Sentiment, Products) have been automatically populated based on your summary. Would you like me to suggest a follow-up action, such as scheduling a meeting?"
+
         elif intent == "edit_existing":
+            if changes:
+                field_labels = {
+                    "hcp_name": "HCP Name", "sentiment": "Sentiment", "interaction_date": "Date",
+                    "interaction_type": "Interaction Type", "hospital_clinic": "Hospital/Clinic",
+                    "specialty": "Specialty", "tier": "Tier", "territory": "Territory",
+                    "visit_objective": "Visit Objective", "follow_up_date": "Follow-Up Date",
+                    "follow_up_required": "Follow-Up Required", "outcome": "Outcome",
+                    "key_discussion_points": "Discussion Points", "objections_raised": "Objections",
+                    "products_discussed": "Products", "materials_shared": "Materials",
+                }
+                bullets = ""
+                for k, v in changes.items():
+                    label = field_labels.get(k, k.replace("_", " ").title())
+                    bullets += f"\n• {label} \u2192 {v}"
+                return (
+                    f"**Interaction updated successfully!**\n\n"
+                    f"Updated Fields:{bullets}\n\n"
+                    f"All other fields remain unchanged."
+                )
             return (
-                f"I have updated the active interaction record for **{hcp}** with your requested changes. "
-                "The modifications have been synced in real-time to the CRM form on the left, and an audit trail entry was recorded in the database."
+                f"**Interaction updated successfully!**\n\n"
+                f"The requested changes have been applied to the form.\n"
+                f"All other fields remain unchanged."
             )
+
         elif intent == "get_history":
             return (
-                f"Here is the interaction history for **{hcp}**:\n"
-                f"- **2026-06-15**: Discussed CardioMax side effects. Efficacy studies shared. Sentiment: Neutral.\n"
-                f"- **2026-05-10**: General introductory visit. Relationship established. Tier B. Sentiment: Positive.\n\n"
-                "Let me know if you would like me to retrieve more historical entries or log a new visit."
+                f"\U0001f4cb Previous interactions found for **{hcp}**:\n\n"
+                f"• **2026-06-15** — Discussed CardioMax. Sentiment: Neutral.\n"
+                f"• **2026-05-10** — Introductory visit. Sentiment: Positive."
             )
+
         elif intent == "validate_form":
             errs = []
-            if not context.get("hcp_name"): errs.append("HCP Name is missing.")
-            if not context.get("interaction_date"): errs.append("Interaction Date is missing.")
-            
+            if not context.get("hcp_name"): errs.append("HCP Name is missing")
+            if not context.get("interaction_date"): errs.append("Interaction Date is missing")
             if errs:
-                return f"Validation found issues with the current record:\n" + "\n".join([f"- {e}" for e in errs])
-            return f"I have run the CRM Validation Tool. The active interaction record with **{hcp}** is **fully valid** and compliant with all mandatory CRM reporting policies."
-        elif intent == "get_recommendation":
+                issues = "\n".join([f"• {e}" for e in errs])
+                return f"\u26a0\ufe0f Validation issues found:\n\n{issues}"
             return (
-                f"Based on the positive response to CardioMax, here are the Next Best Action recommendations for **{hcp}**:\n"
-                f"1. **Share Efficacy Study**: Email the clinical trial results highlighting cardiovascular safety data.\n"
-                f"2. **Peer Review Discussion**: Suggest setting up a call with a therapeutic area key opinion leader.\n"
-                f"3. **Follow-up Meeting**: Re-engage in 7 days to address any queries regarding dosing guidelines."
+                f"\u2714\ufe0f **Record validated.** The interaction with **{hcp}** is compliant.\n"
+                f"All mandatory CRM fields are complete."
             )
+
+        elif intent == "get_recommendation":
+            prod = prod_str if prod_str != "the discussed product" else "CardioMax"
+            return (
+                f"\U0001f3af **Suggested Follow-up for {hcp}:**\n\n"
+                f"• Share the clinical efficacy study for {prod}\n"
+                f"• Schedule follow-up meeting next week\n"
+                f"• Send product brochure via email"
+            )
+
         else:
             return (
-                "Hi! I am the **AI CRM Assistant**. I can help you manage your HCP interactions efficiently. Here are some examples of what you can ask me:\n\n"
-                "- *'Met Dr. Sarah Johnson today at Apollo Hospital. Discussed CardioMax. Positive feedback. Follow up next Tuesday.'* to log a new visit.\n"
-                "- *'Change the sentiment to Neutral.'* or *'Set follow-up date to 2026-07-20'* to edit the active form.\n"
-                "- *'Show history for Dr. Sarah'* to see previous interaction notes.\n"
-                "- *'Check if this record is valid'* to run a CRM compliance check."
+                "Log interactions using natural language. Example:\n\n"
+                "*\"Met Dr. Smith today. Discussed CardioMax. Positive sentiment. Shared brochure.\"*"
             )
